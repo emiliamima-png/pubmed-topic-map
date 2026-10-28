@@ -1,26 +1,31 @@
 """
-PubMed Topic Map — Shiny for Python + BERTopic
-==============================================
+Literature Topic Map — Shiny for Python + BERTopic
+==================================================
 
-1. Runs a PubMed search strategy through the NCBI E-utilities and downloads the
-   records (title, author keywords, optional MeSH terms, abstract, journal, year, DOI).
+1. Runs a search strategy in PubMed (NCBI E-utilities) or OpenAlex and downloads the
+   records (title, keywords, optional MeSH terms, abstract, journal, year, DOI, PMID).
 2. Builds one document per article ("title. keywords. abstract") and embeds it with a
    sentence-transformers model.
 3. Fits BERTopic (UMAP -> HDBSCAN -> c-TF-IDF) to find topics, and fits a separate 2D UMAP
    on the same embeddings to draw the map.
-4. Overlays a comparison list (PMIDs and/or DOIs, optionally grouped). Articles from the
-   list that are in the search results are drawn at their own position. Articles that are
-   not in the results can be fetched, embedded and *projected* onto the same map (and assigned
-   a topic) using the fitted UMAP and BERTopic models. The app also reports how many list
-   articles the search strategy retrieves, which works as a recall check.
+4. Overlays a comparison list (PMIDs, DOIs or OpenAlex IDs, optionally grouped). Articles
+   from the list that are in the search results are drawn at their own position. Articles
+   that are not can be fetched, embedded and *projected* onto the same map (and assigned a
+   topic). The app also reports how many list articles the search strategy retrieves
+   (a recall check).
 
-Run:   pip install -r requirements.txt
-       shiny run --reload app.py
+Run locally:   pip install -r requirements.txt
+               shiny run --launch-browser app.py
+
+Optional environment variables (e.g. as secrets on a hosting service), used when the
+corresponding box in the app is left empty:
+    NCBI_EMAIL, NCBI_API_KEY, OPENALEX_API_KEY
 """
 
 from __future__ import annotations
 
 import html
+import os
 import re
 import textwrap
 import time
@@ -34,16 +39,31 @@ import requests
 from shiny import App, reactive, render, req, ui
 from shinywidgets import output_widget, render_plotly
 
+MAX_RECORDS = 9999
+DB_NAMES = {"pubmed": "PubMed", "openalex": "OpenAlex"}
+
+
+def _batches(seq: list, size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _empty_record() -> dict:
+    return {"key": "", "pmid": "", "openalex_id": "", "doi": "", "title": "", "abstract": "",
+            "keywords": [], "mesh": [], "journal": "", "year": None}
+
+
 # ----------------------------------------------------------------------------------------
 # PubMed client (NCBI E-utilities)
 # ----------------------------------------------------------------------------------------
 
 EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
-MAX_PUBMED_RECORDS = 9999  # E-utilities will not page past 9,999 records for PubMed
 
 
 class PubMedClient:
-    def __init__(self, email: str, api_key: str | None = None, tool: str = "pubmed_topic_map"):
+    name = "PubMed"
+
+    def __init__(self, email: str, api_key: str | None = None, tool: str = "literature_topic_map"):
         self.base = {"tool": tool, "email": email}
         if api_key:
             self.base["api_key"] = api_key
@@ -77,27 +97,29 @@ class PubMedClient:
             raise RuntimeError(f"PubMed error: {e['ERROR']}")
         return e
 
-    def search(self, term: str, sort: str = "relevance") -> tuple[int, str, str]:
-        e = self._esr(self._get("esearch.fcgi", db="pubmed", term=term, usehistory="y",
+    # -- search ---------------------------------------------------------------------------
+    def search_records(self, query: str, n: int, sort: str, progress=None) -> tuple[int, list[dict]]:
+        e = self._esr(self._get("esearch.fcgi", db="pubmed", term=query, usehistory="y",
                                 retmax=0, retmode="json", sort=sort))
-        return int(e["count"]), e["webenv"], e["querykey"]
-
-    def fetch_history(self, webenv: str, query_key: str, n: int, batch: int = 200,
-                      progress=None) -> list[dict]:
+        count = int(e["count"])
+        if count == 0:
+            return 0, []
+        n = min(count, n, MAX_RECORDS)
         recs: list[dict] = []
-        for start in range(0, n, batch):
-            r = self._get("efetch.fcgi", db="pubmed", WebEnv=webenv, query_key=query_key,
-                          retstart=start, retmax=min(batch, n - start), retmode="xml")
+        for start in range(0, n, 200):
+            r = self._get("efetch.fcgi", db="pubmed", WebEnv=e["webenv"],
+                          query_key=e["querykey"], retstart=start,
+                          retmax=min(200, n - start), retmode="xml")
             recs.extend(parse_pubmed_xml(r.content))
             if progress:
-                progress(min(start + batch, n), n)
-        return recs
+                progress(min(start + 200, n), n)
+        return count, recs
 
-    def fetch_pmids(self, pmids: list[str], batch: int = 200) -> list[dict]:
+    # -- comparison list --------------------------------------------------------------------
+    def fetch_pmids(self, pmids: list[str]) -> list[dict]:
         recs: list[dict] = []
-        for i in range(0, len(pmids), batch):
-            r = self._get("efetch.fcgi", db="pubmed", id=",".join(pmids[i:i + batch]),
-                          retmode="xml")
+        for chunk in _batches(pmids, 200):
+            r = self._get("efetch.fcgi", db="pubmed", id=",".join(chunk), retmode="xml")
             recs.extend(parse_pubmed_xml(r.content))
         return recs
 
@@ -107,11 +129,23 @@ class PubMedClient:
         ids = e.get("idlist", [])
         return ids[0] if len(ids) == 1 else None
 
-    def filter_by_query(self, query: str, pmids: list[str], batch: int = 200) -> set[str]:
-        """Return the subset of `pmids` that the search strategy retrieves (recall check)."""
+    def resolve(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], dict]:
+        """Map (kind, value) identifiers to full records. OpenAlex IDs are not supported."""
+        to_pmid: dict[tuple[str, str], str] = {}
+        for kind, val in pairs:
+            if kind == "pmid":
+                to_pmid[(kind, val)] = val
+            elif kind == "doi":
+                pid = self.doi_to_pmid(val)
+                if pid:
+                    to_pmid[(kind, val)] = pid
+        recs = {r["pmid"]: r for r in self.fetch_pmids(sorted(set(to_pmid.values())))}
+        return {kv: recs[p] for kv, p in to_pmid.items() if p in recs}
+
+    def retrieved(self, query: str, records: list[dict]) -> set[str]:
+        """Keys of `records` that the search strategy retrieves (recall check)."""
         hits: set[str] = set()
-        for i in range(0, len(pmids), batch):
-            chunk = pmids[i:i + batch]
+        for chunk in _batches([r["key"] for r in records], 200):
             term = f"({query}) AND ({' OR '.join(f'{p}[uid]' for p in chunk)})"
             e = self._esr(self._get("esearch.fcgi", db="pubmed", term=term,
                                     retmax=len(chunk), retmode="json"))
@@ -149,8 +183,10 @@ def parse_pubmed_xml(content: bytes) -> list[dict]:
         for aid in art.findall("PubmedData/ArticleIdList/ArticleId"):
             if aid.get("IdType") == "doi" and aid.text:
                 doi = aid.text.strip().lower()
+        pmid = _text(mc.find("PMID"))
         out.append({
-            "pmid": _text(mc.find("PMID")),
+            **_empty_record(),
+            "key": pmid, "pmid": pmid, "doi": doi,
             "title": _text(a.find("ArticleTitle")),
             "abstract": abstract,
             "keywords": [k for k in (_text(x) for x in mc.findall("KeywordList/Keyword")) if k],
@@ -158,10 +194,162 @@ def parse_pubmed_xml(content: bytes) -> list[dict]:
                                  mc.findall("MeshHeadingList/MeshHeading/DescriptorName")) if m],
             "journal": _text(a.find("Journal/Title")),
             "year": _year(a),
-            "doi": doi,
         })
     return out
 
+
+# ----------------------------------------------------------------------------------------
+# OpenAlex client
+# ----------------------------------------------------------------------------------------
+
+OPENALEX = "https://api.openalex.org"
+OA_SELECT = ("id,doi,ids,title,display_name,publication_year,primary_location,keywords,"
+             "mesh,abstract_inverted_index")
+OA_PAGE = 100
+
+
+class OpenAlexError(RuntimeError):
+    def __init__(self, status: int, message: str):
+        super().__init__(f"OpenAlex error {status}: {message}")
+        self.status = status
+
+
+class OpenAlexClient:
+    name = "OpenAlex"
+
+    def __init__(self, api_key: str | None, scope: str = "tiab", extra_filters: str = ""):
+        self.api_key = api_key or None
+        self.scope = scope
+        self.extra = (extra_filters or "").strip().strip(",")
+        self.session = requests.Session()
+
+    def _get(self, params: dict) -> dict:
+        p = dict(params)
+        if self.api_key:
+            p["api_key"] = self.api_key
+        for attempt in range(5):
+            r = self.session.get(OPENALEX + "/works", params=p, timeout=90)
+            if r.status_code == 429 or r.status_code >= 500:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if r.status_code in (401, 402, 403, 409):
+                raise OpenAlexError(r.status_code, (
+                    "the request was refused, most likely because the daily free allowance "
+                    "is used up or the API key is wrong. Get a free API key at openalex.org "
+                    "(account settings) and enter it in the app."))
+            if r.status_code >= 400:
+                try:
+                    j = r.json()
+                    msg = j.get("message") or j.get("error") or r.text[:300]
+                except ValueError:
+                    msg = r.text[:300]
+                raise OpenAlexError(r.status_code, str(msg))
+            return r.json()
+        raise RuntimeError("OpenAlex is not responding (too many requests). Try again shortly.")
+
+    def _query_params(self, query: str) -> dict:
+        filters = []
+        if self.scope == "tiab":
+            # commas separate filters in OpenAlex, so they can't appear inside the search text
+            filters.append("title_and_abstract.search:" + query.replace(",", " "))
+        if self.extra:
+            filters.append(self.extra)
+        p = {"filter": ",".join(filters)} if filters else {}
+        if self.scope != "tiab":
+            p["search"] = query
+        return p
+
+    # -- search ---------------------------------------------------------------------------
+    def search_records(self, query: str, n: int, sort: str, progress=None) -> tuple[int, list[dict]]:
+        params = {**self._query_params(query), "per_page": OA_PAGE, "cursor": "*",
+                  "select": OA_SELECT,
+                  "sort": {"relevance": "relevance_score:desc",
+                           "pub_date": "publication_date:desc"}.get(sort, "relevance_score:desc")}
+        try:
+            j = self._get(params)
+        except OpenAlexError as e:
+            if e.status != 400:
+                raise
+            params.pop("sort")  # some query types can't be sorted by relevance
+            j = self._get(params)
+        count = int(j["meta"]["count"])
+        target = min(count, n, MAX_RECORDS)
+        recs = [parse_openalex(w) for w in j["results"]]
+        while len(recs) < target and j["results"] and j["meta"].get("next_cursor"):
+            if progress:
+                progress(len(recs), target)
+            params["cursor"] = j["meta"]["next_cursor"]
+            j = self._get(params)
+            recs.extend(parse_openalex(w) for w in j["results"])
+        if progress:
+            progress(target, target)
+        return count, recs[:target]
+
+    # -- comparison list --------------------------------------------------------------------
+    def resolve(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], dict]:
+        out: dict[tuple[str, str], dict] = {}
+        specs = {"doi": ("doi", lambda v: "https://doi.org/" + v, lambda r: r["doi"]),
+                 "pmid": ("ids.pmid", str, lambda r: r["pmid"]),
+                 "openalex": ("ids.openalex", str, lambda r: r["key"])}
+        for kind, (field, fmt, getter) in specs.items():
+            vals = sorted({v for k, v in pairs if k == kind and not re.search(r"[|,]", v)})
+            for chunk in _batches(vals, 50):
+                wanted = set(chunk)
+                j = self._get({"filter": f"{field}:" + "|".join(fmt(v) for v in chunk),
+                               "per_page": OA_PAGE, "select": OA_SELECT})
+                for w in j["results"]:
+                    r = parse_openalex(w)
+                    v = getter(r)
+                    if v in wanted:
+                        out.setdefault((kind, v), r)
+        return out
+
+    def retrieved(self, query: str, records: list[dict]) -> set[str]:
+        hits: set[str] = set()
+        base = self._query_params(query)
+        for chunk in _batches([r["key"] for r in records], 50):
+            p = dict(base)
+            idf = "ids.openalex:" + "|".join(chunk)
+            p["filter"] = f"{p['filter']},{idf}" if p.get("filter") else idf
+            j = self._get({**p, "per_page": OA_PAGE, "select": "id"})
+            hits.update(w["id"].rsplit("/", 1)[-1] for w in j["results"])
+        return hits
+
+
+def _clean_html(s: str | None) -> str:
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", s or ""))).strip()
+
+
+def abstract_from_inverted(inv: dict | None) -> str:
+    if not inv:
+        return ""
+    pos = sorted((p, w) for w, ps in inv.items() for p in ps)
+    return _clean_html(" ".join(w for _, w in pos))
+
+
+def parse_openalex(w: dict) -> dict:
+    ids = w.get("ids") or {}
+    src = (w.get("primary_location") or {}).get("source") or {}
+    mesh = list(dict.fromkeys(m.get("descriptor_name") for m in (w.get("mesh") or [])
+                              if m.get("descriptor_name")))
+    oid = (w.get("id") or "").rsplit("/", 1)[-1]
+    return {
+        **_empty_record(),
+        "key": oid, "openalex_id": oid,
+        "pmid": (ids.get("pmid") or "").rstrip("/").rsplit("/", 1)[-1],
+        "doi": re.sub(r"^https?://(dx\.)?doi\.org/", "", (w.get("doi") or "")).lower(),
+        "title": _clean_html(w.get("title") or w.get("display_name")),
+        "abstract": abstract_from_inverted(w.get("abstract_inverted_index")),
+        "keywords": [k["display_name"] for k in (w.get("keywords") or []) if k.get("display_name")],
+        "mesh": mesh,
+        "journal": src.get("display_name") or "",
+        "year": w.get("publication_year"),
+    }
+
+
+# ----------------------------------------------------------------------------------------
+# Documents and comparison-list parsing
+# ----------------------------------------------------------------------------------------
 
 def build_doc(rec: dict, use_mesh: bool) -> str:
     """Title first, then keywords, then abstract, so the parts that matter most survive
@@ -179,16 +367,15 @@ def build_doc(rec: dict, use_mesh: bool) -> str:
     return " ".join(parts).strip()
 
 
-# ----------------------------------------------------------------------------------------
-# Comparison-list parsing
-# ----------------------------------------------------------------------------------------
-
 def classify_id(token: str) -> tuple[str | None, str]:
     t = token.strip().strip("\"'")
     t = re.sub(r"^(pmid|pubmed)\s*[:#]?\s*", "", t, flags=re.I)
     t = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:\s*)", "", t, flags=re.I)
+    t = re.sub(r"^https?://(api\.)?openalex\.org/(works/)?", "", t, flags=re.I)
     if re.fullmatch(r"\d{1,9}", t):
         return "pmid", t
+    if re.fullmatch(r"[Ww]\d{4,12}", t):
+        return "openalex", t.upper()
     if re.match(r"10\.\d{4,9}/\S+$", t):
         return "doi", t.lower().rstrip(".")
     return None, t
@@ -219,12 +406,13 @@ def entries_from_upload(fileinfo: list[dict]) -> list[dict]:
     df = pd.read_csv(path, sep=None, engine="python", dtype=str).fillna("")
     cols = {c.lower().strip(): c for c in df.columns}
     pmid_c, doi_c = cols.get("pmid"), cols.get("doi")
+    oa_c = cols.get("openalex") or cols.get("openalex_id")
     grp_c = cols.get("group") or cols.get("label") or cols.get("list")
-    id_c = cols.get("id") or (None if (pmid_c or doi_c) else df.columns[0])
+    id_c = cols.get("id") or (None if (pmid_c or doi_c or oa_c) else df.columns[0])
     rows = []
     for _, r in df.iterrows():
-        raw = (r[pmid_c] if pmid_c else "") or (r[doi_c] if doi_c else "") or (r[id_c] if id_c else "")
-        raw = str(raw).strip()
+        raw = next((str(r[c]).strip() for c in (pmid_c, doi_c, oa_c, id_c)
+                    if c and str(r[c]).strip()), "")
         if not raw:
             continue
         kind, val = classify_id(raw)
@@ -335,6 +523,10 @@ def _wrap(s: str, width: int = 90) -> str:
     return "<br>".join(textwrap.wrap(html.escape(s or ""), width)) or "(no title)"
 
 
+def _id_label(pmid: str, openalex_id: str) -> str:
+    return f"PMID {pmid}" if pmid else (f"OpenAlex {openalex_id}" if openalex_id else "")
+
+
 def build_figure(corp: dict, comp: pd.DataFrame | None, show_outliers: bool = True,
                  show_labels: bool = True, dim: bool = True) -> go.Figure:
     df = corp["df"]
@@ -392,18 +584,40 @@ def build_figure(corp: dict, comp: pd.DataFrame | None, show_outliers: bool = Tr
 # UI
 # ----------------------------------------------------------------------------------------
 
+DEFAULT_QUERY = {
+    "pubmed": '("machine learning"[tiab] OR "deep learning"[tiab]) AND sepsis[mh]',
+    "openalex": '("machine learning" OR "deep learning") AND sepsis',
+}
+
 app_ui = ui.page_sidebar(
     ui.sidebar(
         ui.accordion(
             ui.accordion_panel(
-                "1 · PubMed search",
-                ui.input_text_area(
-                    "query", "Search strategy (PubMed syntax)", rows=6,
-                    value='("machine learning"[tiab] OR "deep learning"[tiab]) AND sepsis[mh]'),
-                ui.input_text("email", "Your e-mail (required by NCBI)", ""),
-                ui.input_password("api_key", "NCBI API key (optional, faster)", ""),
+                "1 · Search",
+                ui.input_radio_buttons("source", "Database",
+                                       {"pubmed": "PubMed", "openalex": "OpenAlex"}, inline=True),
+                ui.input_text_area("query", "Search strategy", rows=6,
+                                   value=DEFAULT_QUERY["pubmed"]),
+                ui.panel_conditional(
+                    "input.source === 'pubmed'",
+                    ui.p("PubMed syntax, exactly as on the PubMed website (field tags such as "
+                         "[tiab] and [mh] work).", class_="small text-muted"),
+                    ui.input_text("email", "Your e-mail (required by NCBI)", ""),
+                    ui.input_password("api_key", "NCBI API key (optional, faster)", ""),
+                ),
+                ui.panel_conditional(
+                    "input.source === 'openalex'",
+                    ui.p("Use AND, OR, NOT in capitals and \"quoted phrases\". PubMed field tags "
+                         "like [tiab] or [mh] do not work here.", class_="small text-muted"),
+                    ui.input_password("oa_key", "OpenAlex API key (free; needed beyond small tests)", ""),
+                    ui.input_select("oa_scope", "Search in",
+                                    {"tiab": "Title & abstract",
+                                     "all": "Title, abstract & full text"}),
+                    ui.input_text("oa_filters", "Extra OpenAlex filters (optional)",
+                                  placeholder="publication_year:2015-2025,type:article"),
+                ),
                 ui.input_numeric("max_records", "Max. articles to retrieve", 2000,
-                                 min=30, max=MAX_PUBMED_RECORDS, step=100),
+                                 min=30, max=MAX_RECORDS, step=100),
                 ui.input_select("sort", "Order when capped",
                                 {"relevance": "Best match", "pub_date": "Most recent"}),
             ),
@@ -419,7 +633,8 @@ app_ui = ui.page_sidebar(
             ui.accordion_panel(
                 "3 · Comparison list",
                 ui.input_text_area(
-                    "compare_ids", "PMIDs or DOIs, one per line (optional ' | group')", rows=6,
+                    "compare_ids", "PMIDs, DOIs or OpenAlex IDs, one per line (optional ' | group')",
+                    rows=6,
                     placeholder="31234567\n10.1016/j.jclinepi.2020.01.001\n32345678 | Included studies"),
                 ui.input_file("compare_file", "…or upload CSV/TXT (columns pmid, doi, group)",
                               accept=[".csv", ".tsv", ".txt"]),
@@ -431,7 +646,7 @@ app_ui = ui.page_sidebar(
                     col_widths=[8, 4],
                 ),
             ),
-            id="settings", open=["1 · PubMed search", "3 · Comparison list"], multiple=True,
+            id="settings", open=["1 · Search", "3 · Comparison list"], multiple=True,
         ),
         ui.input_action_button("run", "Run search & build map", class_="btn-primary w-100"),
         width=400,
@@ -464,7 +679,7 @@ app_ui = ui.page_sidebar(
             ui.download_button("dl_comparison", "Comparison list results (CSV)"),
         ),
     ),
-    title="PubMed topic map · BERTopic",
+    title="Literature topic map · BERTopic",
     fillable=False,
 )
 
@@ -474,41 +689,62 @@ app_ui = ui.page_sidebar(
 # ----------------------------------------------------------------------------------------
 
 def server(input, output, session):
-    corpus = reactive.value(None)       # dict: df, models, labels, query, hit count
+    corpus = reactive.value(None)       # dict: df, models, labels, source, query, hit count
     comparison = reactive.value(None)   # DataFrame of list articles and their placement
-    status_msg = reactive.value("Enter a search strategy and your e-mail, then click "
+    status_msg = reactive.value("Choose a database, enter a search strategy, then click "
                                 "<b>Run search &amp; build map</b>.")
 
-    def client() -> PubMedClient:
-        email = input.email().strip()
-        if "@" not in email:
-            raise ValueError("NCBI requires a valid e-mail address for E-utilities requests.")
-        return PubMedClient(email, input.api_key().strip() or None)
+    # Swap the example query when switching database, unless the user has edited it
+    @reactive.effect
+    @reactive.event(input.source, ignore_init=True)
+    def _swap_example():
+        if input.query().strip() in DEFAULT_QUERY.values():
+            ui.update_text_area("query", value=DEFAULT_QUERY[input.source()])
+
+    def make_client(source: str, scope: str = "tiab", extra: str = ""):
+        if source == "pubmed":
+            email = input.email().strip() or os.environ.get("NCBI_EMAIL", "")
+            if "@" not in email:
+                raise ValueError("NCBI requires a valid e-mail address for PubMed searches.")
+            return PubMedClient(email, input.api_key().strip() or os.environ.get("NCBI_API_KEY"))
+        return OpenAlexClient(input.oa_key().strip() or os.environ.get("OPENALEX_API_KEY"),
+                              scope, extra)
 
     # ---- Build the map ------------------------------------------------------------------
     @reactive.effect
     @reactive.event(input.run)
     def _run():
         query = input.query().strip()
+        source = input.source()
         if not query:
             ui.notification_show("Please enter a search strategy.", type="warning")
             return
+        if source == "openalex" and re.search(r"\[[a-z ]+\]", query, flags=re.I):
+            ui.notification_show("The search contains PubMed field tags like [tiab]; OpenAlex "
+                                 "ignores or rejects these. Remove them for OpenAlex.",
+                                 type="warning", duration=10)
         try:
+            scope, extra = input.oa_scope(), input.oa_filters()
+            client = make_client(source, scope, extra)
+            if source == "openalex" and not client.api_key:
+                ui.notification_show("No OpenAlex API key: fine for a quick test, but larger "
+                                     "searches need a free key from openalex.org.",
+                                     type="warning", duration=10)
             with ui.Progress(min=0, max=100) as p:
-                pm = client()
-                p.set(2, message="Searching PubMed")
-                count, webenv, qk = pm.search(query, sort=input.sort())
-                if count == 0:
-                    raise ValueError("The search returned no results.")
-                n = min(count, int(input.max_records() or 2000), MAX_PUBMED_RECORDS)
+                p.set(2, message=f"Searching {client.name}")
 
                 def fetch_prog(done, total):
-                    p.set(2 + 33 * done / total, message="Downloading records",
+                    p.set(2 + 33 * done / max(total, 1), message="Downloading records",
                           detail=f"{done:,} / {total:,}")
 
-                recs = pm.fetch_history(webenv, qk, n, progress=fetch_prog)
-                recs = [r for r in recs if r["pmid"] and r["title"]]
-                df = pd.DataFrame(recs).drop_duplicates("pmid").reset_index(drop=True)
+                count, recs = client.search_records(query, int(input.max_records() or 2000),
+                                                    input.sort(), progress=fetch_prog)
+                if count == 0:
+                    raise ValueError("The search returned no results.")
+                recs = [r for r in recs if r["key"] and r["title"]]
+                df = pd.DataFrame(recs).drop_duplicates("key")
+                df = df[~(df["doi"].ne("") & df["doi"].duplicated())]
+                df = df[~df["title"].str.lower().str.strip(" .").duplicated()].reset_index(drop=True)
                 df["doc"] = [build_doc(r, input.use_mesh()) for r in df.to_dict("records")]
                 if len(df) < 20:
                     raise ValueError(f"Only {len(df)} usable records; BERTopic needs more "
@@ -524,22 +760,25 @@ def server(input, output, session):
             df["topic"] = res["topics"].astype(int)
             df["topic_label"] = df["topic"].map(res["labels"])
             df["x"], df["y"] = res["xy"][:, 0], res["xy"][:, 1]
-            df["year"] = df["year"].astype("Int64")
+            df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
             df["hover"] = [
                 f"<b>{_wrap(r.title)}</b><br>{html.escape(r.journal or '')} "
-                f"({r.year if pd.notna(r.year) else 'n.d.'}) · PMID {r.pmid}<br>"
+                f"({r.year if pd.notna(r.year) else 'n.d.'}) · {_id_label(r.pmid, r.openalex_id)}<br>"
                 f"Topic: {html.escape(r.topic_label)}"
                 for r in df.itertuples()
             ]
-            corpus.set({**res, "df": df, "query": query, "count": count})
+            corpus.set({**res, "df": df, "source": source, "query": query, "count": count,
+                        "scope": scope, "extra": extra})
             comparison.set(None)
 
             n_topics = len([t for t in res["labels"] if t != -1])
             n_out = int((df["topic"] == -1).sum())
+            n_abs = int((df["abstract"].str.len() > 0).sum())
             cap = (f" <span class='text-warning'>(capped: the search has {count:,} hits; "
-                   f"only {len(df):,} were mapped)</span>") if count > n else ""
-            status_msg.set(f"<b>{count:,}</b> PubMed hits · <b>{len(df):,}</b> articles mapped · "
-                           f"<b>{n_topics}</b> topics · {n_out:,} outliers{cap}")
+                   f"only {len(df):,} were mapped)</span>") if count > len(recs) else ""
+            status_msg.set(f"{client.name}: <b>{count:,}</b> hits · <b>{len(df):,}</b> articles "
+                           f"mapped ({n_abs:,} with abstract) · <b>{n_topics}</b> topics · "
+                           f"{n_out:,} outliers{cap}")
             if input.compare_ids().strip() or input.compare_file():
                 _do_overlay()
         except Exception as e:  # noqa: BLE001
@@ -562,79 +801,106 @@ def server(input, output, session):
             ui.notification_show("The comparison list is empty.", type="warning")
             return
         df = corp["df"]
-        pm = client()
+        db = DB_NAMES[corp["source"]]
+        client = make_client(corp["source"], corp["scope"], corp["extra"])
+
+        keys = set(df["key"])
+        by_pmid = {p: k for p, k in zip(df["pmid"], df["key"]) if p}
+        by_doi = {d: k for d, k in zip(df["doi"], df["key"]) if d}
+
+        def corpus_key(kind: str, val: str) -> str | None:
+            if kind == "pmid":
+                return by_pmid.get(val)
+            if kind == "doi":
+                return by_doi.get(val)
+            if kind == "openalex":
+                return val if val in keys else None
+            return None
+
+        comp = pd.DataFrame(entries).drop_duplicates(["raw", "group"]).reset_index(drop=True)
+        pairs = sorted({(e["kind"], e["value"]) for e in entries if e["kind"]})
+        on_map = {kv: corpus_key(*kv) for kv in pairs}
+
         with ui.Progress(min=0, max=100) as p:
-            p.set(5, message="Resolving identifiers")
-            doi_map = {d: pid for d, pid in zip(df["doi"], df["pmid"]) if d}
-            for e in entries:
-                if e["kind"] == "pmid":
-                    e["pmid"] = e["value"]
-                elif e["kind"] == "doi":
-                    e["pmid"] = doi_map.get(e["value"]) or pm.doi_to_pmid(e["value"])
+            p.set(10, message=f"Looking up list articles in {db}")
+            missing = [kv for kv, k in on_map.items() if k is None]
+            resolved = client.resolve(missing) if missing else {}
+
+            outside: dict[str, dict] = {}       # record key -> record (not on the map)
+            outside_of: dict[tuple, str] = {}   # (kind, value) -> record key
+            for kv, rec in resolved.items():
+                ck = rec["key"] if rec["key"] in keys else None
+                ck = ck or (by_doi.get(rec["doi"]) if rec["doi"] else None)
+                ck = ck or (by_pmid.get(rec["pmid"]) if rec["pmid"] else None)
+                if ck:
+                    on_map[kv] = ck
                 else:
-                    e["pmid"] = None
-            comp = pd.DataFrame(entries).drop_duplicates(["raw", "group"]).reset_index(drop=True)
+                    outside[rec["key"]] = rec
+                    outside_of[kv] = rec["key"]
 
-            resolved = sorted({p_ for p_ in comp["pmid"] if p_})
-            corpus_set = set(df["pmid"])
-            p.set(25, message="Checking which list articles the search retrieves")
-            matched = pm.filter_by_query(corp["query"], resolved) if resolved else set()
-
-            outside = [p_ for p_ in resolved if p_ not in corpus_set]
-            p.set(45, message="Fetching list articles not on the map", detail=f"{len(outside)}")
-            rec_map = {r["pmid"]: r for r in (pm.fetch_pmids(outside) if outside else [])}
+            p.set(35, message="Checking which list articles the search retrieves")
+            matched = client.retrieved(corp["query"], list(outside.values())) if outside else set()
 
             proj = {}
-            if input.project_missing() and rec_map:
-                p.set(70, message="Projecting onto the map", detail="embedding + UMAP transform")
-                pmids = list(rec_map)
-                docs = [build_doc(rec_map[k], input.use_mesh()) for k in pmids]
+            if input.project_missing() and outside:
+                p.set(65, message="Projecting onto the map", detail="embedding + UMAP transform")
+                okeys = list(outside)
+                docs = [build_doc(outside[k], input.use_mesh()) for k in okeys]
                 emb = corp["embedder"].encode(docs, batch_size=32, show_progress_bar=False,
                                               normalize_embeddings=True)
                 topics, _ = corp["topic_model"].transform(docs, embeddings=emb)
                 xy = corp["reducer2d"].transform(emb)
                 proj = {k: (float(xy[i, 0]), float(xy[i, 1]), int(topics[i]))
-                        for i, k in enumerate(pmids)}
+                        for i, k in enumerate(okeys)}
 
-        by_pmid = df.set_index("pmid")
+        by_key = df.set_index("key")
         rows = []
         for e in comp.to_dict("records"):
-            pid = e["pmid"]
-            r = {"input": e["raw"], "group": e["group"], "pmid": pid or "",
-                 "in_pubmed": False, "retrieved_by_search": bool(pid and pid in matched),
-                 "on_map": False, "placement": "not placed", "placed": False,
-                 "x": np.nan, "y": np.nan, "topic": pd.NA, "topic_label": "", "title": "",
-                 "year": pd.NA, "status": ""}
+            if not isinstance(e["kind"], str):  # pandas turns None into NaN
+                e["kind"] = None
+            kv = (e["kind"], e["value"])
+            r = {"input": e["raw"], "group": e["group"], "pmid": "", "doi": "",
+                 "openalex_id": "", "found": False, "retrieved_by_search": False,
+                 "placement": "not placed", "placed": False, "x": np.nan, "y": np.nan,
+                 "topic": pd.NA, "topic_label": "", "title": "", "year": pd.NA, "status": ""}
+            ck = on_map.get(kv) if e["kind"] else None
             if e["kind"] is None:
                 r["status"] = "Unrecognised identifier"
-            elif not pid:
-                r["status"] = "DOI not found in PubMed"
-            elif pid in corpus_set:
-                a = by_pmid.loc[pid]
-                r.update(in_pubmed=True, on_map=True, placement="corpus", placed=True,
-                         x=a["x"], y=a["y"], topic=int(a["topic"]),
+            elif ck:
+                a = by_key.loc[ck]
+                r.update(pmid=a["pmid"], doi=a["doi"], openalex_id=a["openalex_id"],
+                         found=True, retrieved_by_search=True, placement="corpus",
+                         placed=True, x=a["x"], y=a["y"], topic=int(a["topic"]),
                          topic_label=a["topic_label"], title=a["title"], year=a["year"],
                          status="In search results (on map)")
-            elif pid in rec_map:
-                rec = rec_map[pid]
-                r.update(in_pubmed=True, title=rec["title"], year=rec["year"])
-                why = ("retrieved by the search but beyond the record cap"
-                       if r["retrieved_by_search"] else "not retrieved by the search")
-                if pid in proj:
-                    x, y, t = proj[pid]
+            elif kv in outside_of:
+                k = outside_of[kv]
+                rec = outside[k]
+                hit = k in matched
+                r.update(pmid=rec["pmid"], doi=rec["doi"], openalex_id=rec["openalex_id"],
+                         found=True, retrieved_by_search=hit, title=rec["title"],
+                         year=rec["year"])
+                why = ("retrieved by the search but beyond the record cap" if hit
+                       else "not retrieved by the search")
+                if k in proj:
+                    x, y, t = proj[k]
                     r.update(placement="projected", placed=True, x=x, y=y, topic=t,
                              topic_label=corp["labels"].get(t, f"T{t}"),
                              status=f"Projected: {why}")
                 else:
                     r["status"] = f"Not placed: {why}"
+            elif e["kind"] == "openalex" and corp["source"] == "pubmed":
+                r["status"] = "OpenAlex ID: use a PMID or DOI with PubMed"
             else:
-                r["status"] = "PMID not found in PubMed"
+                r["status"] = f"Not found in {db}"
             rows.append(r)
 
         out = pd.DataFrame(rows)
+        out["year"] = pd.to_numeric(out["year"], errors="coerce").astype("Int64")
         out["hover"] = [
-            f"<b>[{html.escape(r.group)}] {_wrap(r.title)}</b><br>PMID {r.pmid} · "
-            f"{html.escape(r.status)}<br>Topic: {html.escape(r.topic_label)}"
+            f"<b>[{html.escape(r.group)}] {_wrap(r.title)}</b><br>"
+            f"{_id_label(r.pmid, r.openalex_id)} · {html.escape(r.status)}<br>"
+            f"Topic: {html.escape(r.topic_label)}"
             for r in out.itertuples()
         ]
         comparison.set(out)
@@ -692,12 +958,14 @@ def server(input, output, session):
         df["keywords"] = df["keywords"].map("; ".join)
         df["mesh"] = df["mesh"].map("; ".join)
         df["has_abstract"] = df["abstract"].str.len() > 0
-        return df[["pmid", "year", "journal", "title", "topic", "topic_label", "keywords",
-                   "mesh", "has_abstract", "doi", "abstract", "x", "y"]]
+        return df[["pmid", "openalex_id", "doi", "year", "journal", "title", "topic",
+                   "topic_label", "keywords", "mesh", "has_abstract", "abstract", "x", "y"]]
 
     @render.data_frame
     def articles_table():
         d = articles_df().drop(columns=["abstract", "mesh", "x", "y"])
+        if corpus()["source"] == "pubmed":
+            d = d.drop(columns=["openalex_id"])
         return render.DataGrid(d, filters=True, height="650px")
 
     @render.ui
@@ -706,18 +974,20 @@ def server(input, output, session):
         if comp is None:
             return ui.p("No comparison list overlaid yet.", class_="text-muted")
         corp = corpus()
+        db = DB_NAMES[corp["source"]] if corp else "the database"
         n = len(comp)
-        in_pm = int(comp["in_pubmed"].sum())
+        found = int(comp["found"].sum())
         retr = int(comp["retrieved_by_search"].sum())
         on_map = int((comp["placement"] == "corpus").sum())
         projd = int((comp["placement"] == "projected").sum())
-        recall = f"{100 * retr / in_pm:.1f}%" if in_pm else "n/a"
+        recall = f"{100 * retr / found:.1f}%" if found else "n/a"
         notes = ""
         if corp and corp["count"] > len(corp["df"]):
-            notes = ("<br><i>The map holds only part of the search results (record cap), so "
-                     "some retrieved articles are projected rather than drawn from the corpus.</i>")
+            notes = ("<br><i>The map holds only part of the search results (record cap or "
+                     "duplicates removed), so some retrieved articles are projected rather "
+                     "than drawn from the corpus.</i>")
         return ui.div(ui.HTML(
-            f"<b>{n}</b> identifiers · <b>{in_pm}</b> found in PubMed · "
+            f"<b>{n}</b> identifiers · <b>{found}</b> found in {db} · "
             f"<b>{retr}</b> retrieved by the search strategy (<b>recall {recall}</b>) · "
             f"{on_map} on the map from the results · {projd} projected · "
             f"{n - on_map - projd} not placed{notes}"), class_="mb-3")
@@ -726,12 +996,14 @@ def server(input, output, session):
     def comparison_table():
         comp = comparison()
         req(comp is not None)
-        cols = ["input", "group", "pmid", "status", "retrieved_by_search", "topic_label",
-                "year", "title"]
-        return render.DataGrid(comp[cols], filters=True, height="550px")
+        cols = ["input", "group", "status", "retrieved_by_search", "topic_label", "year",
+                "title", "pmid", "doi", "openalex_id"]
+        d = comp[cols].copy()
+        d["year"] = d["year"].astype(str).replace("<NA>", "")
+        return render.DataGrid(d, filters=True, height="550px")
 
     # ---- Downloads ------------------------------------------------------------------------
-    @render.download(filename="pubmed_topic_map.html")
+    @render.download(filename="topic_map.html")
     def dl_map():
         corp = corpus()
         req(corp)
@@ -739,15 +1011,15 @@ def server(input, output, session):
                            input.dim())
         yield fig.to_html(include_plotlyjs="cdn")
 
-    @render.download(filename="pubmed_topic_map_articles.csv")
+    @render.download(filename="topic_map_articles.csv")
     def dl_articles():
         yield articles_df().to_csv(index=False)
 
-    @render.download(filename="pubmed_topic_map_topics.csv")
+    @render.download(filename="topic_map_topics.csv")
     def dl_topics():
         yield topics_df().to_csv(index=False)
 
-    @render.download(filename="pubmed_topic_map_comparison.csv")
+    @render.download(filename="topic_map_comparison.csv")
     def dl_comparison():
         comp = comparison()
         req(comp is not None)
